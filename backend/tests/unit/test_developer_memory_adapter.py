@@ -544,7 +544,13 @@ def test_developer_vector_adapter_uses_hydrated_vector_service_and_preserves_ran
         )
 
     result = search_memory_default_developer_memories_vector(
-        uid='u1', query='coffee', limit=10, db_client=db_client, rollout_decision=decision, vector_query=vector_query
+        uid='u1',
+        query='coffee',
+        limit=10,
+        db_client=db_client,
+        rollout_decision=decision,
+        vector_query=vector_query,
+        now=now,
     )
     assert result.read_decision == MemoryReadDecision.USE_MEMORY
     assert result.fallback_reason is None
