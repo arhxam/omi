@@ -398,11 +398,30 @@ async def _record_audio(websocket: Any) -> None:
     )
 
 
-async def _request_finalization(stack: Stack, conversation_id: str, uid: str) -> httpx.Response:
+async def _request_concurrent_finalization(
+    stack: Stack, conversation_id: str, uid: str, *, requests: int = 4
+) -> list[httpx.Response]:
+    """Race repeated REST admissions before the durable outbox is terminal.
+
+    This is the production duplicate-submission boundary: every request uses
+    the public REST route and its Firestore transaction, then any losing
+    enqueue reaches the real named Cloud Tasks dispatcher. Four concurrent
+    requests make the interleaving reproducible without adding a test-only
+    route or mutating the persisted conversation state.
+    """
+    if requests < 2:
+        raise ValueError('concurrent finalization proof requires at least two requests')
     async with httpx.AsyncClient(timeout=15.0, trust_env=False) as client:
-        return await client.post(
-            f'http://127.0.0.1:{stack.backend_port}/v1/conversations/{conversation_id}/finalize',
-            headers={'Authorization': f'Bearer {ADMIN_KEY}{uid}'},
+        return list(
+            await asyncio.gather(
+                *(
+                    client.post(
+                        f'http://127.0.0.1:{stack.backend_port}/v1/conversations/{conversation_id}/finalize',
+                        headers={'Authorization': f'Bearer {ADMIN_KEY}{uid}'},
+                    )
+                    for _ in range(requests)
+                )
+            )
         )
 
 
@@ -588,13 +607,14 @@ async def _durable_rest_finalization_survives_backend_restart(stack: Stack) -> N
         return bool(conversation and conversation.get('has_content'))
 
     _wait_until(content_persisted, label='persisted content before REST finalization')
-    accepted = await _request_finalization(stack, session_id, uid)
-    if accepted.status_code != 200:
-        raise StackFailure(f'durable REST finalization returned HTTP {accepted.status_code}: {accepted.text[:300]}')
-    accepted_payload = accepted.json()
-    conversation_payload = accepted_payload.get('conversation') if isinstance(accepted_payload, dict) else None
-    if not isinstance(conversation_payload, dict) or conversation_payload.get('status') != 'processing':
-        raise StackFailure('durable REST finalization did not promptly return the admitted processing snapshot')
+    accepted_responses = await _request_concurrent_finalization(stack, session_id, uid)
+    for accepted in accepted_responses:
+        if accepted.status_code != 200:
+            raise StackFailure(f'durable REST finalization returned HTTP {accepted.status_code}: {accepted.text[:300]}')
+        accepted_payload = accepted.json()
+        conversation_payload = accepted_payload.get('conversation') if isinstance(accepted_payload, dict) else None
+        if not isinstance(conversation_payload, dict) or conversation_payload.get('status') != 'processing':
+            raise StackFailure('durable REST finalization did not promptly return the admitted processing snapshot')
 
     task_events: list[dict[str, Any]] = []
 
@@ -628,6 +648,21 @@ async def _durable_rest_finalization_survives_backend_restart(stack: Stack) -> N
     task_headers = {str(key).lower(): value for key, value in dict(task.get('headers') or {}).items()}
     if task_headers.get('content-type') != 'application/json':
         raise StackFailure('durable finalization task omitted its JSON content type')
+
+    # Concurrent REST retries must reach the real named-task dispatcher but
+    # retain one outbox job and one Cloud Tasks task. The local client records
+    # the exact AlreadyExists boundary so this cannot pass merely because a
+    # retry happened to return after the conversation was already processing.
+    duplicate_task_events = [event for event in stack.task_events if event.get('event') == 'task_already_exists']
+    if not duplicate_task_events:
+        raise StackFailure('concurrent REST finalization did not exercise Cloud Tasks named-task deduplication')
+    if any(
+        event.get('task_name') != expected_task_name or event.get('payload') != expected_payload
+        for event in duplicate_task_events
+    ):
+        raise StackFailure('duplicate Cloud Tasks enqueue changed its durable task identity')
+    if len(stack.jobs_for(uid, session_id)) != 1 or job.get('attempt_count') != 0:
+        raise StackFailure('duplicate REST finalization created work beyond the one queued outbox job')
 
     queued_status = await _finalization_status(stack, session_id, uid)
     if (

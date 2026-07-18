@@ -58,6 +58,8 @@ def test_listen_pusher_stack_gauntlet_has_a_deterministic_hermetic_ci_job() -> N
     # dropping its durable scenario from the blocking CI command.
     assert 'durable_dispatch_app:app' in runner
     assert '_durable_rest_finalization_survives_backend_restart' in runner
+    assert '_request_concurrent_finalization' in runner
     assert 'v1/conversation-finalization-jobs/run' in runner
     assert 'AlreadyExists' in durable_entrypoint
+    assert 'task_already_exists' in durable_entrypoint
     assert 'durable REST-finalization path' in readme

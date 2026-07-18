@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from threading import Lock
 from typing import Any
 
 from fastapi import HTTPException, Request
@@ -24,6 +25,7 @@ from utils.conversations import lifecycle as lifecycle_service
 LOCAL_TASK_TOKEN = os.getenv('LISTEN_FINALIZATION_LOCAL_TASK_TOKEN', 'omi-listen-pusher-stack-local-task')
 TASK_EVENTS_FILENAME = 'finalization-tasks.jsonl'
 WORKER_EVENTS_FILENAME = 'finalization-worker.jsonl'
+_TASK_EVENTS_LOCK = Lock()
 
 
 def _state_path(filename: str) -> Path | None:
@@ -59,25 +61,38 @@ class _LocalCloudTasksClient:
         if not isinstance(payload, dict):
             raise ValueError('local Cloud Tasks client received a non-object task payload')
         task_name = str(task.name)
-        if any(event.get('task_name') == task_name for event in _read_task_events()):
-            # Match Cloud Tasks named-task deduplication across backend
-            # restarts. The production dispatcher catches this exception and
-            # treats an uncertain duplicate handoff as a safe success.
-            raise AlreadyExists(f'local task already exists: {task_name}')
-        _record(
-            TASK_EVENTS_FILENAME,
-            {
-                'event': 'task_created',
-                'parent': parent,
-                'task_name': task_name,
-                'url': str(http_request.url),
-                'payload': payload,
-                'headers': dict(http_request.headers),
-                'oidc_audience': str(http_request.oidc_token.audience),
-                'oidc_service_account': str(http_request.oidc_token.service_account_email),
-                'dispatch_deadline_seconds': int(task.dispatch_deadline.seconds),
-            },
-        )
+        # Several REST retries can reach this boundary concurrently. Keep the
+        # local recorder atomic too, otherwise two test threads could both
+        # observe an empty JSONL file and falsely record two named tasks.
+        with _TASK_EVENTS_LOCK:
+            if any(event.get('task_name') == task_name for event in _read_task_events()):
+                # Match Cloud Tasks named-task deduplication across backend
+                # restarts. The production dispatcher catches this exception
+                # and treats an uncertain duplicate handoff as a safe success.
+                _record(
+                    TASK_EVENTS_FILENAME,
+                    {
+                        'event': 'task_already_exists',
+                        'parent': parent,
+                        'task_name': task_name,
+                        'payload': payload,
+                    },
+                )
+                raise AlreadyExists(f'local task already exists: {task_name}')
+            _record(
+                TASK_EVENTS_FILENAME,
+                {
+                    'event': 'task_created',
+                    'parent': parent,
+                    'task_name': task_name,
+                    'url': str(http_request.url),
+                    'payload': payload,
+                    'headers': dict(http_request.headers),
+                    'oidc_audience': str(http_request.oidc_token.audience),
+                    'oidc_service_account': str(http_request.oidc_token.service_account_email),
+                    'dispatch_deadline_seconds': int(task.dispatch_deadline.seconds),
+                },
+            )
         return task
 
 

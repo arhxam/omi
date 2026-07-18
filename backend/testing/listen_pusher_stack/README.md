@@ -74,7 +74,9 @@ Scenarios:
 5. live audio content is finalized through `POST /v1/conversations/{id}/finalize`;
    the generated named Cloud Tasks wake-up contains exactly `{job_id,
    dispatch_generation}`, no user or conversation ID, and the customer status
-   projection stays queued before delivery;
+   projection stays queued before delivery. Concurrent REST retries exercise
+   the named-task `AlreadyExists` path and retain exactly one outbox job and
+   one recorded Cloud Tasks task;
 6. an unauthenticated task request is rejected without claiming the job; after
    a real backend restart, the authenticated worker completes the same job and
    durable fanout once, while an at-least-once duplicate delivery is safely
