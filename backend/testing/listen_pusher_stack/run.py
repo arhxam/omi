@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlencode
 
+import httpx
 import redis
 import websockets
 from google.cloud import firestore
@@ -36,6 +37,7 @@ BACKEND = ROOT / 'backend'
 PYTHON = BACKEND / '.venv' / 'bin' / 'python'
 ADMIN_KEY = 'omi-listen-pusher-stack-admin-'
 PROJECT = 'demo-omi-listen-stack'
+LOCAL_TASK_TOKEN = 'omi-listen-pusher-stack-local-task'
 
 
 class StackFailure(AssertionError):
@@ -88,8 +90,10 @@ def _read_events(path: Path) -> list[dict[str, Any]]:
 
 
 class Stack:
-    def __init__(self, state_dir: Path):
+    def __init__(self, state_dir: Path, *, durable_dispatch: bool = False):
         self.state_dir = state_dir
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        self.durable_dispatch = durable_dispatch
         self.redis_port = _free_port()
         self.backend_port = _free_port()
         self.pusher_port = _free_port()
@@ -135,11 +139,27 @@ class Stack:
                 'HOSTED_PARAKEET_API_URL': f'http://127.0.0.1:{self.parakeet_port}',
                 'STT_SERVICE_MODELS': 'parakeet',
                 'TRIAL_PAYWALL_ENABLED': 'false',
-                'LISTEN_FINALIZATION_DISPATCH_MODE': 'inline',
+                'LISTEN_FINALIZATION_DISPATCH_MODE': 'cloud_tasks' if self.durable_dispatch else 'inline',
                 'OMI_STACK_STATE_DIR': str(self.state_dir),
                 'PYTHONPATH': str(BACKEND),
             }
         )
+        if self.durable_dispatch:
+            # The durable scenario records the exact task proto instead of
+            # sending it to Cloud Tasks.  The worker still receives a real
+            # HTTP request and checks the configured audience/identity before
+            # it can touch the Firestore job.
+            handler_url = f'http://127.0.0.1:{self.backend_port}/v1/conversation-finalization-jobs/run'
+            env.update(
+                {
+                    'SYNC_TASKS_PROJECT': PROJECT,
+                    'SYNC_TASKS_LOCATION': 'us-central1',
+                    'LISTEN_FINALIZATION_TASKS_QUEUE': 'conversation-finalization',
+                    'LISTEN_FINALIZATION_TASKS_HANDLER_URL': handler_url,
+                    'LISTEN_FINALIZATION_TASKS_INVOKER_SA': 'local-finalization@demo-omi-listen-stack.iam.gserviceaccount.com',
+                    'LISTEN_FINALIZATION_LOCAL_TASK_TOKEN': LOCAL_TASK_TOKEN,
+                }
+            )
         return env
 
     def _start(self, name: str, command: list[str], *, extra_env: dict[str, str] | None = None) -> Child:
@@ -149,7 +169,10 @@ class Stack:
         process_env = self.env.copy()
         if extra_env:
             process_env.update(extra_env)
-        output = log_path.open('wb')
+        # A recovery scenario restarts a child deliberately. Keep both sides
+        # of that boundary in retained evidence instead of overwriting the
+        # process that accepted the durable handoff.
+        output = log_path.open('ab')
         process = subprocess.Popen(
             command,
             cwd=BACKEND,
@@ -215,9 +238,13 @@ class Stack:
             extra_env=pusher_env,
         )
         _wait_for_port(self.pusher_port, label='pusher')
+        self._start_backend()
+
+    def _start_backend(self) -> None:
+        module = 'testing.listen_pusher_stack.durable_dispatch_app:app' if self.durable_dispatch else 'main:app'
         self._start(
             'backend',
-            [str(PYTHON), '-m', 'uvicorn', 'main:app', '--host', '127.0.0.1', '--port', str(self.backend_port)],
+            [str(PYTHON), '-m', 'uvicorn', module, '--host', '127.0.0.1', '--port', str(self.backend_port)],
         )
         _wait_for_port(self.backend_port, label='listen backend', timeout=45.0)
 
@@ -240,6 +267,10 @@ class Stack:
         )
         _wait_for_port(self.pusher_port, label='restarted pusher')
 
+    def restart_backend(self) -> None:
+        self.stop('backend')
+        self._start_backend()
+
     def stop(self, name: str) -> None:
         child = self.children.pop(name, None)
         if not child or child.process.poll() is not None:
@@ -260,6 +291,14 @@ class Stack:
     @property
     def pusher_events(self) -> list[dict[str, Any]]:
         return _read_events(self.state_dir / 'pusher.jsonl')
+
+    @property
+    def task_events(self) -> list[dict[str, Any]]:
+        return _read_events(self.state_dir / 'finalization-tasks.jsonl')
+
+    @property
+    def worker_events(self) -> list[dict[str, Any]]:
+        return _read_events(self.state_dir / 'finalization-worker.jsonl')
 
     def seed_user(self, uid: str) -> None:
         # Private cloud is enabled solely to exercise 103 + 101.  The pusher
@@ -357,6 +396,42 @@ async def _record_audio(websocket: Any) -> None:
         lambda payload: isinstance(payload, list) and bool(payload) and payload[0].get('id') == 'stack-segment-1',
         label='streamed transcript',
     )
+
+
+async def _request_finalization(stack: Stack, conversation_id: str, uid: str) -> httpx.Response:
+    async with httpx.AsyncClient(timeout=15.0, trust_env=False) as client:
+        return await client.post(
+            f'http://127.0.0.1:{stack.backend_port}/v1/conversations/{conversation_id}/finalize',
+            headers={'Authorization': f'Bearer {ADMIN_KEY}{uid}'},
+        )
+
+
+async def _finalization_status(stack: Stack, conversation_id: str, uid: str) -> dict[str, Any]:
+    async with httpx.AsyncClient(timeout=15.0, trust_env=False) as client:
+        response = await client.get(
+            f'http://127.0.0.1:{stack.backend_port}/v1/conversations/{conversation_id}/finalization',
+            headers={'Authorization': f'Bearer {ADMIN_KEY}{uid}'},
+        )
+    if response.status_code != 200:
+        raise StackFailure(f'finalization status returned HTTP {response.status_code}: {response.text[:300]}')
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise StackFailure('finalization status did not return an object')
+    return payload
+
+
+async def _deliver_finalization_task(
+    stack: Stack, task: dict[str, Any], *, authorization: str | None
+) -> httpx.Response:
+    payload = task.get('payload')
+    url = task.get('url')
+    if not isinstance(payload, dict) or not isinstance(url, str):
+        raise StackFailure('recorded Cloud Tasks wake-up did not contain an HTTP payload and URL')
+    headers = {'X-CloudTasks-TaskRetryCount': '0'}
+    if authorization:
+        headers['Authorization'] = authorization
+    async with httpx.AsyncClient(timeout=15.0, trust_env=False) as client:
+        return await client.post(url, json=payload, headers=headers)
 
 
 def _wait_for_job(
@@ -495,7 +570,136 @@ async def _pusher_restart_replay(stack: Stack) -> None:
     await websocket.close(code=1000)
 
 
-async def run_scenarios(stack: Stack) -> None:
+async def _durable_rest_finalization_survives_backend_restart(stack: Stack) -> None:
+    """Exercise REST -> Firestore outbox -> task worker across a process loss."""
+    if not stack.durable_dispatch:
+        raise StackFailure('durable finalization scenario requires a Cloud Tasks dispatch stack')
+
+    uid = 'stack-rest-finalization'
+    session_id = str(uuid.uuid4())
+    stack.seed_user(uid)
+    websocket, session = await _connect(stack, uid, session_id)
+    if session.get('conversation_id') != session_id:
+        raise StackFailure('durable REST recording did not keep its requested native UUID')
+    await _record_audio(websocket)
+
+    def content_persisted() -> bool:
+        conversation = stack.conversation(uid, session_id)
+        return bool(conversation and conversation.get('has_content'))
+
+    _wait_until(content_persisted, label='persisted content before REST finalization')
+    accepted = await _request_finalization(stack, session_id, uid)
+    if accepted.status_code != 200:
+        raise StackFailure(f'durable REST finalization returned HTTP {accepted.status_code}: {accepted.text[:300]}')
+    accepted_payload = accepted.json()
+    conversation_payload = accepted_payload.get('conversation') if isinstance(accepted_payload, dict) else None
+    if not isinstance(conversation_payload, dict) or conversation_payload.get('status') != 'processing':
+        raise StackFailure('durable REST finalization did not promptly return the admitted processing snapshot')
+
+    task_events: list[dict[str, Any]] = []
+
+    def task_recorded() -> bool:
+        nonlocal task_events
+        task_events = [event for event in stack.task_events if event.get('event') == 'task_created']
+        return len(task_events) == 1
+
+    _wait_until(task_recorded, label='opaque Cloud Tasks wake-up')
+    task = task_events[0]
+    job = _wait_for_job(stack, uid, session_id, 'queued')
+    expected_payload = {'job_id': job['id'], 'dispatch_generation': 1}
+    if task.get('payload') != expected_payload:
+        raise StackFailure(f'Cloud Tasks wake-up was not the exact opaque job payload: {task.get("payload")}')
+    payload_text = json.dumps(task['payload'], sort_keys=True)
+    if uid in payload_text or session_id in payload_text:
+        raise StackFailure('Cloud Tasks wake-up exposed a user or conversation identifier')
+    expected_task_name = (
+        f'projects/{PROJECT}/locations/us-central1/queues/conversation-finalization/'
+        f'tasks/listen-finalization-{job["id"]}-1'
+    )
+    if task.get('task_name') != expected_task_name:
+        raise StackFailure('durable finalization created an unexpected named Cloud Tasks task')
+    expected_url = f'http://127.0.0.1:{stack.backend_port}/v1/conversation-finalization-jobs/run'
+    if task.get('url') != expected_url or task.get('oidc_audience') != expected_url:
+        raise StackFailure('durable finalization task did not target the configured worker audience')
+    if task.get('oidc_service_account') != 'local-finalization@demo-omi-listen-stack.iam.gserviceaccount.com':
+        raise StackFailure('durable finalization task did not retain its configured OIDC invoker')
+    if task.get('dispatch_deadline_seconds') != 1500:
+        raise StackFailure('durable finalization task did not retain the production dispatch deadline')
+    task_headers = {str(key).lower(): value for key, value in dict(task.get('headers') or {}).items()}
+    if task_headers.get('content-type') != 'application/json':
+        raise StackFailure('durable finalization task omitted its JSON content type')
+
+    queued_status = await _finalization_status(stack, session_id, uid)
+    if (
+        queued_status.get('job_id') != job['id']
+        or queued_status.get('status') != 'queued'
+        or queued_status.get('terminal')
+        or not queued_status.get('retryable')
+        or queued_status.get('attempt_count') != 0
+    ):
+        raise StackFailure(f'queued finalization status projection was incorrect: {queued_status}')
+
+    # The real route must reject an unauthenticated Cloud Tasks delivery before
+    # claiming the job.  This test seam substitutes only remote JWKS lookup;
+    # it leaves the worker route, dependency binding, and opaque parser real.
+    denied = await _deliver_finalization_task(stack, task, authorization=None)
+    if denied.status_code != 403:
+        raise StackFailure(f'worker accepted an unauthenticated task delivery: HTTP {denied.status_code}')
+    if _wait_for_job(stack, uid, session_id, 'queued').get('attempt_count') != 0:
+        raise StackFailure('unauthenticated task delivery changed the durable job claim state')
+
+    # Lose the backend after the durable task exists but before it is delivered.
+    # The original WebSocket has no in-process finalizer fallback to recover it.
+    stack.restart_backend()
+    delivered = await _deliver_finalization_task(stack, task, authorization=f'Bearer {LOCAL_TASK_TOKEN}')
+    if delivered.status_code != 200 or delivered.json() != {'status': 'done'}:
+        raise StackFailure(
+            f'first task delivery did not complete the real worker: {delivered.status_code} {delivered.text[:300]}'
+        )
+
+    completed_status = await _finalization_status(stack, session_id, uid)
+    if (
+        completed_status.get('job_id') != job['id']
+        or completed_status.get('status') != 'completed'
+        or not completed_status.get('terminal')
+        or completed_status.get('retryable')
+        or completed_status.get('attempt_count') != 1
+    ):
+        raise StackFailure(f'completed finalization status projection was incorrect: {completed_status}')
+    completed_job = _wait_for_job(stack, uid, session_id, 'completed')
+    if completed_job.get('fanout_status') != 'completed':
+        raise StackFailure('durable task worker completed the job without durable integration fanout completion')
+
+    worker_events = stack.worker_events
+    expected_worker_events = {'process_completed': 1, 'memory_extraction_skipped': 1, 'integration_fanout_skipped': 1}
+    observed_worker_events = {
+        event: sum(row.get('event') == event for row in worker_events) for event in expected_worker_events
+    }
+    if observed_worker_events != expected_worker_events:
+        raise StackFailure(f'worker did not reach each provider seam exactly once: {observed_worker_events}')
+    process_event = next(event for event in worker_events if event.get('event') == 'process_completed')
+    if not process_event.get('persisted') or not process_event.get('force_process'):
+        raise StackFailure('durable REST worker did not persist the route-required force_process finalization')
+    if not process_event.get('defer_memory_extraction'):
+        raise StackFailure('durable finalizer did not retain its owned memory-extraction ordering')
+
+    duplicate = await _deliver_finalization_task(stack, task, authorization=f'Bearer {LOCAL_TASK_TOKEN}')
+    if duplicate.status_code != 200 or duplicate.json() != {'status': 'acked', 'job_status': 'completed'}:
+        raise StackFailure(
+            f'duplicate task delivery was not safely acknowledged: {duplicate.status_code} {duplicate.text[:300]}'
+        )
+    if len([event for event in stack.task_events if event.get('event') == 'task_created']) != 1:
+        raise StackFailure('worker delivery recreated a durable Cloud Tasks task')
+    if _wait_for_job(stack, uid, session_id, 'completed').get('attempt_count') != 1:
+        raise StackFailure('duplicate task delivery ran the completed finalizer more than once')
+    if len(stack.worker_events) != len(worker_events):
+        raise StackFailure('duplicate task delivery repeated a provider-side finalization leaf')
+
+    with suppress(Exception):
+        await websocket.close(code=1000)
+
+
+async def run_inline_scenarios(stack: Stack) -> None:
     await _normal_and_terminal_reconnect(stack)
     await _empty_recording(stack)
     await _pusher_restart_replay(stack)
@@ -505,22 +709,45 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--state-dir', type=Path, help='directory for sanitized process logs and JSONL evidence')
     parser.add_argument('--keep', action='store_true', help='preserve generated evidence after a successful run')
+    parser.add_argument(
+        '--suite',
+        choices=('all', 'inline', 'durable'),
+        default='all',
+        help='run the full gauntlet (default), only live listen/pusher scenarios, or only durable REST finalization',
+    )
     args = parser.parse_args()
     if not PYTHON.exists():
         raise SystemExit(f'missing backend virtual environment: {PYTHON}; run backend/scripts/sync-python-deps.sh')
     state_dir = args.state_dir or Path(tempfile.mkdtemp(prefix='omi-listen-pusher-stack-'))
     state_dir.mkdir(parents=True, exist_ok=True)
-    stack = Stack(state_dir)
+    stacks: list[Stack] = []
     try:
-        stack.start()
-        asyncio.run(run_scenarios(stack))
-        print(f'listen-pusher stack gauntlet passed; evidence: {state_dir}')
+        completed_suites: list[str] = []
+        if args.suite in {'all', 'inline'}:
+            inline_stack = Stack(state_dir / 'inline')
+            stacks.append(inline_stack)
+            inline_stack.start()
+            asyncio.run(run_inline_scenarios(inline_stack))
+            inline_stack.close()
+            completed_suites.append('listen-pusher')
+
+        if args.suite in {'all', 'durable'}:
+            durable_stack = Stack(state_dir / 'durable-finalization', durable_dispatch=True)
+            stacks.append(durable_stack)
+            durable_stack.start()
+            asyncio.run(_durable_rest_finalization_survives_backend_restart(durable_stack))
+            durable_stack.close()
+            completed_suites.append('durable-finalization')
+
+        noun = 'gauntlet' if len(completed_suites) == 1 else 'gauntlets'
+        print(f'{" and ".join(completed_suites)} stack {noun} passed; evidence: {state_dir}')
         return 0
     except Exception as error:
         print(f'listen-pusher stack gauntlet failed; evidence retained: {state_dir}', file=sys.stderr)
         raise
     finally:
-        stack.close()
+        for stack in reversed(stacks):
+            stack.close()
         if not args.keep and not sys.exc_info()[0]:
             shutil.rmtree(state_dir)
 

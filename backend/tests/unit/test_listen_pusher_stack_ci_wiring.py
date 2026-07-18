@@ -37,4 +37,27 @@ def test_listen_pusher_stack_gauntlet_has_a_deterministic_hermetic_ci_job() -> N
         contract for contract in contracts['workflows'] if contract['id'] == 'listen_pusher_pipeline'
     )
     assert 'backend/testing/listen_pusher_stack/**' in listen_contract['sources']
+    assert {
+        'backend/routers/conversations.py',
+        'backend/routers/conversation_finalization.py',
+        'backend/services/conversation_finalization.py',
+        'backend/utils/cloud_tasks.py',
+        'backend/database/conversation_finalization_jobs.py',
+        'backend/database/sync_jobs.py',
+    }.issubset(listen_contract['sources'])
     assert 'tests/unit/test_listen_pusher_stack_ci_wiring.py' in listen_contract['tests']
+
+    runner = (_REPO_ROOT / 'backend' / 'testing' / 'listen_pusher_stack' / 'run.py').read_text(encoding='utf-8')
+    durable_entrypoint = (
+        _REPO_ROOT / 'backend' / 'testing' / 'listen_pusher_stack' / 'durable_dispatch_app.py'
+    ).read_text(encoding='utf-8')
+    readme = (_REPO_ROOT / 'backend' / 'testing' / 'listen_pusher_stack' / 'README.md').read_text(encoding='utf-8')
+
+    # Static wiring tripwire: the behavioral proof is the separately-run
+    # emulator stack, while this prevents a future refactor from silently
+    # dropping its durable scenario from the blocking CI command.
+    assert 'durable_dispatch_app:app' in runner
+    assert '_durable_rest_finalization_survives_backend_restart' in runner
+    assert 'v1/conversation-finalization-jobs/run' in runner
+    assert 'AlreadyExists' in durable_entrypoint
+    assert 'durable REST-finalization path' in readme

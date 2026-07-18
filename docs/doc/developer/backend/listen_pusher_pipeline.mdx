@@ -6,7 +6,7 @@ description: "Sequence diagrams for the /v4/listen WebSocket and Pusher processi
 
 # Listen + Pusher Pipeline — Sequence Diagrams
 
-> Last updated: 2026-07-15 (durable recording-session bindings, fenced late-content recovery, and ordered lifecycle envelopes)
+> Last updated: 2026-07-18 (durable recording-session bindings, fenced late-content recovery, ordered lifecycle envelopes, and local finalizer-worker recovery proof)
 >
 > These diagrams document the real behavior observed during E2E testing with
 > live services (backend, pusher, STT providers, embedding API). Update when the
@@ -238,6 +238,24 @@ the worker must never silently use Omi keys.
 
 See [Listen finalization jobs](./listen_finalization_jobs) for configuration,
 replay, metrics, and the operational runbook.
+
+### 2.2 Local durable recovery gauntlet
+
+`backend/testing/listen_pusher_stack/run.sh` is a blocking, credential-free
+Firestore-emulator gauntlet for the live listen/pusher boundary. In addition to
+the real WebSocket → pusher scenarios, it drives a content-bearing recording
+through `POST /v1/conversations/{id}/finalize`, preserves the real Firestore
+outbox transaction and task-worker route, then restarts the backend before
+delivering the recorded task.
+
+The task seam records the production task proto and emulates named-task
+deduplication; it deliberately accepts only a local stand-in for Cloud Tasks
+OIDC. The proof asserts that the task contains only `{job_id,
+dispatch_generation}`, an unauthenticated worker request cannot claim the
+job, the restarted worker reaches durable fanout completion once, and a
+duplicate delivery is acknowledged without repeating a provider-side leaf.
+It does not prove Google Cloud Tasks availability or production JWKS/OIDC;
+those remain deployment-level concerns.
 
 ## 3. Disconnect Path
 
